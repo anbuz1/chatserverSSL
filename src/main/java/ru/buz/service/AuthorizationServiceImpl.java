@@ -1,7 +1,6 @@
 package ru.buz.service;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.log4j.Logger;
 import ru.buz.model.Client;
 
 import java.util.Optional;
@@ -9,7 +8,7 @@ import java.util.Optional;
 import static ru.buz.service.ServerProperties.getServerProperties;
 
 public class AuthorizationServiceImpl implements AuthorizationService {
-    private final Logger LOG = LoggerFactory.getLogger(AuthorizationServiceImpl.class);
+    private final Logger LOG = Logger.getLogger(AuthorizationServiceImpl.class);
     private final ServerProperties serverProperties = getServerProperties();
     private final ClientsHolder clientsHolder;
     private static final String SERVER_KEY = "3h5N!jfl09-sDvF23Kl%jk3i545";

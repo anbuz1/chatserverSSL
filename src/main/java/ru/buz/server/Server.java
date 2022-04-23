@@ -1,79 +1,122 @@
 package ru.buz.server;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.log4j.Logger;
 import ru.buz.model.Client;
 import ru.buz.model.ConnectionMeta;
 import ru.buz.model.ServerClient;
+import ru.buz.server.crypto.SSLConnection;
 import ru.buz.service.AuthorizationService;
+import ru.buz.service.ClientsHolder;
+import ru.buz.service.ServerProperties;
 
+import javax.crypto.BadPaddingException;
+import javax.crypto.Cipher;
+import javax.crypto.IllegalBlockSizeException;
+import javax.crypto.NoSuchPaddingException;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.Serializable;
+import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
-import java.nio.channels.*;
-import java.nio.charset.StandardCharsets;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.security.AlgorithmParameters;
+import java.security.InvalidAlgorithmParameterException;
+import java.security.InvalidKeyException;
+import java.security.NoSuchAlgorithmException;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Optional;
+import java.util.*;
+
+import static ru.buz.service.ServerProperties.getServerProperties;
 
 
-public class Server extends Thread implements Serializable {
+public class Server implements Serializable {
 
     private final List<SocketChannel> channelList;
-    private final Logger LOG = LoggerFactory.getLogger(Server.class);
-    private final int countServerLimit;
-    private final String serverName;
+    private final Logger LOG = Logger.getLogger(Server.class);
     private final AuthorizationService authorizationService;
-    private final GlobalMessageSender globalMessageSender;
+    private final ClientsHolder clientsHolder;
+    private final int SERVER_PORT;
     private int countChannels;
     private Selector selector;
     private boolean closeFlag = true;
     private boolean permissionToSend;
+    private boolean stopTheWork;
+    private final SSLConnection sslConnection;
+    private SecretKeySpec serverAesKey;    //temp
 
-    public Server(int countServerLimit, String serverName, AuthorizationService authorizationService, GlobalMessageSender globalMessageSender) {
-        this.countServerLimit = countServerLimit;
-        this.serverName = serverName;
+
+    public Server(AuthorizationService authorizationService, ClientsHolder clientsHolder) {
+        this.clientsHolder = clientsHolder;
+        ServerProperties serverProperties = getServerProperties();
+        SERVER_PORT = Integer.parseInt(serverProperties.getProperty("server.port", "8080"));
         this.authorizationService = authorizationService;
-        this.globalMessageSender = globalMessageSender;
         this.channelList = new ArrayList<>();
+        this.sslConnection = new SSLConnection();
+    }
 
+    private Server() {
+        this(null, null);
     }
 
 
-    @Override
-    public void run() {
-        try (var selector = Selector.open()) {
-            this.selector = selector;
-            while (closeFlag) {
-                LOG.info("waiting for client");
-                selector.select(this::performIO);
+    public void start() {
+
+        try (var serverSocketChannel = ServerSocketChannel.open()) {
+            serverSocketChannel.configureBlocking(false);
+            serverSocketChannel.socket().bind(new InetSocketAddress(SERVER_PORT));
+            try (var selector = Selector.open()) {
+                serverSocketChannel.register(selector, SelectionKey.OP_ACCEPT);
+                this.selector = selector;
+                while (!stopTheWork) {
+                    LOG.info("waiting for client connection");
+                    selector.select(this::performIO);
+                }
             }
+
         } catch (IOException e) {
-            e.printStackTrace();
+            LOG.error(e.getMessage());
         }
     }
+
+
+//    public void run() {
+//
+//        try (var serverSocketChannel = ServerSocketChannel.open();
+//             var selector = Selector.open()) {
+//            this.selector = selector;
+//            serverSocketChannel.configureBlocking(false);
+//            serverSocketChannel.socket().bind(new InetSocketAddress(SERVER_PORT));
+//            serverSocketChannel.register(selector, SelectionKey.OP_ACCEPT);
+//            while (closeFlag) {
+//                LOG.info("waiting for client connection");
+//                selector.select(this::performIO);
+//            }
+//
+//        } catch (IOException e) {
+//            e.printStackTrace();
+//        }
+//    }
 
     public void close() {
         try {
             selector.close();
-            closeFlag = false;
+            stopTheWork = true;
         } catch (IOException e) {
             e.printStackTrace();
         }
     }
 
-    public int serverCapacity() {
-        return countServerLimit - selector.keys().size();
-    }
 
     public void channelRegistration(SocketChannel socketChannel) {
         ConnectionMeta connectionMeta = new ConnectionMeta(LocalDateTime.now(), new ServerClient());
         try {
             socketChannel.register(selector, SelectionKey.OP_READ, connectionMeta);
-            LOG.info("Register channel: {} on Server: {}", socketChannel, serverName);
-            clientAuthorization(connectionMeta, socketChannel);
-        } catch (ClosedChannelException e) {
+            LOG.info(String.format("Register channel: %s", socketChannel));
+        } catch (IOException e) {
             LOG.error(e.getMessage());
         }
     }
@@ -94,23 +137,70 @@ public class Server extends Thread implements Serializable {
     }
 
     private void performIO(SelectionKey selectedKey) {
-
+        if (selectedKey.isAcceptable()) {
+            LOG.info(String.format("Trying new connection: %s", selectedKey));
+            acceptConnection(selectedKey);
+        }
         if (selectedKey.isReadable()) {
             var connectionMeta = (ConnectionMeta) selectedKey.attachment();
             var socketChannel = (SocketChannel) selectedKey.channel();
-            if (!connectionMeta.isAuthorize()) {
-                clientAuthorization(connectionMeta, socketChannel);
-            } else {
-                handleRequest(socketChannel,connectionMeta);
+            if (!connectionMeta.isConnectionEstablish()) {
+                establishSSLConnection(socketChannel, connectionMeta);
+
+            } else
+            /*if (!connectionMeta.isAuthorize()) {
+                clientAuthorization(connectionMeta,socketChannel);
+            } else*/ {
+                handleRequest(socketChannel, connectionMeta);
             }
         }
     }
 
-    private void handleRequest(SocketChannel socketChannel, ConnectionMeta connectionMeta){
-        var clientMessage = requestToString(socketChannel);
-        // TODO: 22.03.2022 проверить не содержит ли сообщение специальный ключ
+    private void acceptConnection(SelectionKey key) {
+        LOG.info(String.format("accept client connection, key: %s, selector: %s", key, selector));
+        // selector=sun.nio.ch.EPollSelectorImpl - Linux epoll based Selector implementation
+        try {
+            var serverSocketChannel = (ServerSocketChannel) key.channel();
+            var socketChannel = serverSocketChannel.accept(); //The socket channel for the new connection
+            socketChannel.configureBlocking(false);
+            channelRegistration(socketChannel);
 
-        globalMessageSender.send(prepareMessage(clientMessage,connectionMeta));
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+
+    private void handleRequest(SocketChannel socketChannel, ConnectionMeta connectionMeta) {
+        LOG.info(String.format("Start handle message from: %s", connectionMeta.getClient()));
+        var clientMessage = requestToString(socketChannel, connectionMeta);
+        // TODO: 22.03.2022 проверить не содержит ли сообщение специальный ключ
+        Cipher serverCipher = connectionMeta.getEncServerCipher();
+
+        try {
+
+            byte[] ciphertext = serverCipher.doFinal(clientMessage.getBytes());
+
+            socketChannel.write(ByteBuffer.wrap(ciphertext));
+
+        } catch (IllegalBlockSizeException | BadPaddingException | IOException e) {
+            LOG.error(e.getMessage());
+
+        } catch (NullPointerException e) {
+            LOG.error(e.getMessage());
+            try {
+                if (!socketChannel.isConnected()) {
+
+                    LOG.info(String.format("Socket channel was down: %s", socketChannel));
+                } else {
+                    LOG.info(String.format("Closed Socket channel: %s", socketChannel.getLocalAddress()));
+                    socketChannel.close();
+                }
+            } catch (IOException ioException) {
+                LOG.error(e.getMessage());
+            }
+
+        }
 
     }
 
@@ -119,26 +209,53 @@ public class Server extends Thread implements Serializable {
         return name + ": " + clientMessage;
     }
 
-    private String requestToString(SocketChannel socketChannel) {
-        var buffer = ByteBuffer.allocate(50);
-        var inputBuffer = new StringBuilder(100);
+    private String requestToString(SocketChannel socketChannel, ConnectionMeta connectionMeta) {
+        String result = null;
         try {
-            while (socketChannel.read(buffer) > 0) {
-                buffer.flip();
-                var input = StandardCharsets.UTF_8.decode(buffer).toString();
-                LOG.info("from client: {} ", input);
 
-                buffer.flip();
-                inputBuffer.append(input);
-            }
+            Cipher serverCipher = connectionMeta.getDecServerCipher();
+            byte[] recovered = serverCipher.doFinal(Objects.requireNonNull(getRawBytes(socketChannel)));
+            result = new String(recovered);
 
-        } catch (IOException e) {
+        } catch (IllegalBlockSizeException | BadPaddingException | NullPointerException e) {
             LOG.error(e.getMessage());
+            try {
+                socketChannel.close();
+            } catch (IOException ex) {
+                LOG.error(ex.getMessage());
+            }
         }
 
-        String requestFromClient = inputBuffer.toString().replace("\n", "").replace("\r", "");
-        LOG.info("requestFromClient: {} ", requestFromClient);
-        return requestFromClient;
+
+        LOG.info("requestFromClient: " + result);
+        return result;
+    }
+
+    private byte[] getRawBytes(SocketChannel socketChannel) {
+        try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+            var buffer = ByteBuffer.allocate(200);
+            int countRead = 1;
+            int totalReadByte = 0;
+            while (countRead > 0) {
+                countRead = socketChannel.read(buffer);
+                totalReadByte += countRead;
+                buffer.flip();
+                outputStream.write(buffer.array());
+                buffer.flip();
+                buffer.clear();
+            }
+            byte[] tempResultBytes = outputStream.toByteArray();
+            return Arrays.copyOf(tempResultBytes, totalReadByte);
+        } catch (Exception e) {
+            LOG.error(e.getMessage());
+            try {
+                socketChannel.close();
+            } catch (IOException ex) {
+                LOG.error(ex.getMessage());
+            }
+
+        }
+        return null;
     }
 
     private void sendResponse(SocketChannel socketChannel, String responseForClient) {
@@ -162,12 +279,68 @@ public class Server extends Thread implements Serializable {
         }
     }
 
+    private void establishSSLConnection(SocketChannel socketChannel, ConnectionMeta connectionMeta) {
+        if (connectionMeta.getPartOfSSL() == 1) {
+            byte[] pubKey = sslConnection.getPubKey(getRawBytes(socketChannel));
+            serverAesKey = sslConnection.getServerAesKey(); //temp
+            connectionMeta.setServerAesKey(serverAesKey);
+            connectionMeta.setClientPubKey(sslConnection.getClientPubKey());
+
+            try {
+                socketChannel.write(ByteBuffer.wrap(pubKey));
+            } catch (IOException e) {
+                LOG.error(e.getMessage());
+            }
+        }
+        if (connectionMeta.getPartOfSSL() == 2) {
+            try {
+                AlgorithmParameters aesParams = connectionMeta.getAesParams();
+                aesParams.init(getRawBytes(socketChannel));
+                Cipher encServerCipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+
+                try {
+
+                    encServerCipher.init(Cipher.ENCRYPT_MODE, serverAesKey);
+                    encServerCipher.doFinal("".getBytes());
+                    connectionMeta.setEncServerCipher(encServerCipher);
+                    byte[] encodedParamsFromServer = encServerCipher.getParameters().getEncoded();
+                    socketChannel.write(ByteBuffer.wrap(encodedParamsFromServer));
+                } catch (IOException | IllegalBlockSizeException | BadPaddingException e) {
+                    LOG.error(e.getMessage());
+                }
+
+                Cipher decServerCipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                decServerCipher.init(Cipher.DECRYPT_MODE, serverAesKey, aesParams);
+                connectionMeta.setDecServerCipher(decServerCipher);
+                connectionMeta.setConnectionEstablish(true);
+
+
+
+
+                LOG.info(String.format("Connection establish: %s", socketChannel.getRemoteAddress()));
+            } catch (IOException | InvalidAlgorithmParameterException | NoSuchPaddingException | NoSuchAlgorithmException | InvalidKeyException e) {
+                LOG.error(e.getMessage());
+//                try {
+//                    socketChannel.close();
+//                } catch (IOException ioException) {
+//                    ioException.printStackTrace();
+//                }
+            }catch (NullPointerException e){
+             LOG.error(e.getMessage());
+             LOG.info("Socket channel is down!");
+            }
+        }
+        connectionMeta.setPartOfSSL(2);
+
+    }
+
 
     private void clientAuthorization(ConnectionMeta connectionMeta, SocketChannel socketChannel) {
-        var clientMessage = requestToString(socketChannel);
+        var clientMessage = requestToString(socketChannel, connectionMeta);
         Optional<Client> client = authorizationService.authorizeOnServer(clientMessage);
         if (client.isEmpty()) {
             sendResponse(socketChannel, "connection refuse");
+            LOG.info("connection refused");
             try {
                 socketChannel.close();
             } catch (IOException e) {
@@ -176,7 +349,8 @@ public class Server extends Thread implements Serializable {
             return;
         } else {
             connectionMeta.setAuthorize(true);
-            sendResponse(socketChannel, "authorization success");
+            sendResponse(socketChannel, "2ffca3b083298826");
+            channelList.add(socketChannel);
         }
     }
 }

@@ -1,8 +1,7 @@
 package ru.buz.service;
 
 import com.google.gson.Gson;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.log4j.Logger;
 import ru.buz.model.Client;
 
 import java.io.ByteArrayOutputStream;
@@ -15,7 +14,7 @@ import java.util.Optional;
 
 public class ClientsHolderImpl implements ClientsHolder {
     private static final ClientsHolder clientsHolder = new ClientsHolderImpl();
-    private final Logger LOG = LoggerFactory.getLogger(ClientsHolderImpl.class);
+    private final Logger LOG = Logger.getLogger(ClientsHolderImpl.class);
 
     List<Client> clientList;
 
