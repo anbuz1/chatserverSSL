@@ -1,10 +1,6 @@
 package ru.buz.model;
 
 import javax.crypto.Cipher;
-import javax.crypto.spec.SecretKeySpec;
-import java.security.AlgorithmParameters;
-import java.security.NoSuchAlgorithmException;
-import java.security.PublicKey;
 import java.time.LocalDateTime;
 
 public class ConnectionMeta {
@@ -14,21 +10,14 @@ public class ConnectionMeta {
     private boolean isAuthorize;
     private boolean isConnectionEstablish;
     private int partOfSSL = 1;
-    private SecretKeySpec serverAesKey;    //temp
-    private AlgorithmParameters aesParams;
     private Cipher EncServerCipher;
     private Cipher DecServerCipher;
     private LocalDateTime lastMessageTime;
-    private PublicKey clientPubKey;
+
 
     public ConnectionMeta(LocalDateTime startConnectionTime, ServerClient client) {
         this.startConnectionTime = startConnectionTime;
         this.client = client;
-        try {
-            this.aesParams = AlgorithmParameters.getInstance("AES");
-        } catch (NoSuchAlgorithmException e) {
-            e.printStackTrace();
-        }
     }
 
     public boolean isAuthorize() {
@@ -55,19 +44,6 @@ public class ConnectionMeta {
         this.partOfSSL = partOfSSL;
     }
 
-    public SecretKeySpec getServerAesKey() {
-        return serverAesKey;
-    }
-
-    public void setServerAesKey(SecretKeySpec serverAesKey) {
-        this.serverAesKey = serverAesKey;
-    }
-
-    public AlgorithmParameters getAesParams() {
-        return aesParams;
-    }
-
-
     public Cipher getEncServerCipher() {
         return EncServerCipher;
     }
@@ -92,13 +68,6 @@ public class ConnectionMeta {
         return client;
     }
 
-    public PublicKey getClientPubKey() {
-        return clientPubKey;
-    }
-
-    public void setClientPubKey(PublicKey clientPubKey) {
-        this.clientPubKey = clientPubKey;
-    }
 
     public Cipher getDecServerCipher() {
         return DecServerCipher;
